@@ -69,9 +69,10 @@ static const uint16_t DELTA_MAX      = 80;
 static const uint16_t ENTER_FIXED    = 120;   // fallback if calibration fails (12cm)
 static const uint16_t EXIT_FIXED     = 160;
 
-static const uint8_t  NEAR_STABLE    = 1;     // 1 reading → trigger (responsive)
+static const uint8_t  NEAR_STABLE    = 2;     // 2 readings -> trigger (filters early noise)
 static const uint8_t  FAR_STABLE     = 2;     // 2 readings → rearm (~320ms with 20ms budget)
 static const uint16_t READ_PERIOD_MS = 30;
+static const uint16_t DIST_LOG_MS    = 750;   // periodic per-channel distance diagnostics
 static const uint16_t MIN_TRIG_GAP   = 150;
 static const uint8_t  FAIL_RECOVER   = 10;
 static const uint8_t  NCH            = 8;
@@ -91,6 +92,7 @@ struct ChanState {
   bool       armed     = true;
   uint8_t    failStreak= 0;
   uint32_t   lastReadMs= 0;
+  uint32_t   lastLogMs = 0;
   uint32_t   lastTrigMs= 0;
   uint16_t   baseline  = 200;
   uint16_t   enterThr  = ENTER_FIXED;
@@ -101,6 +103,10 @@ struct ChanState {
 ChanState        chs[NCH];
 Adafruit_VL53L0X vl53[NCH];
 Adafruit_VL6180X vl618[NCH];
+
+static const char* sensorTypeName(SensorType t) {
+  return t==ST_VL618 ? "VL6180X" : t==ST_VL53 ? "VL53L0X" : "NONE";
+}
 
 // ---- I2C helpers ----
 static bool tcaSelect(uint8_t ch) {
@@ -143,16 +149,24 @@ static bool initChannel(uint8_t ch) {
   chs[ch].type=ST_NONE; chs[ch].ok=false;
   chs[ch].nearState=false; chs[ch].nearCnt=0; chs[ch].farCnt=0;
   chs[ch].armed=true; chs[ch].failStreak=0;
-  chs[ch].lastReadMs=0; chs[ch].lastTrigMs=0;
+  chs[ch].lastReadMs=0; chs[ch].lastLogMs=0; chs[ch].lastTrigMs=0;
   chs[ch].enterThr=ENTER_FIXED; chs[ch].exitThr=EXIT_FIXED;
 
-  if (!tcaSelect(ch)) return false;
-  if (!i2cPing(0x29)) return false;
+  if (!tcaSelect(ch)) {
+    Serial.print("INIT CH"); Serial.print(ch); Serial.println(": TCA select failed");
+    return false;
+  }
+  if (!i2cPing(0x29)) {
+    Serial.print("INIT CH"); Serial.print(ch); Serial.println(": no sensor response @0x29");
+    return false;
+  }
 
   // Detect sensor type inline (avoids Arduino auto-prototype conflict with custom return type)
   SensorType t = ST_VL53;
   { uint8_t model=0; if (i2cReg16(0x29,0x0000,model) && model==0xB4) t=ST_VL618; }
   chs[ch].type=t;
+  Serial.print("INIT CH"); Serial.print(ch);
+  Serial.print(": detected "); Serial.println(sensorTypeName(t));
   if (t==ST_NONE) return false;
 
   bool ok=false;
@@ -170,6 +184,8 @@ static bool initChannel(uint8_t ch) {
     chs[ch].minValid=MIN_VL53;
   }
   chs[ch].ok=ok;
+  Serial.print("INIT CH"); Serial.print(ch);
+  Serial.print(": "); Serial.println(ok ? "OK" : "begin failed");
   return ok;
 }
 
@@ -233,12 +249,21 @@ static void sortU16(uint16_t* arr, uint8_t n) {
 static void calibrateChannel(uint8_t ch) {
   if (!chs[ch].ok) return;
   uint16_t samples[CAL_SAMPLES]; uint8_t cnt=0;
+  uint8_t rejected=0;
+  Serial.print("CAL CH"); Serial.print(ch);
+  Serial.print(" ["); Serial.print(sensorTypeName(chs[ch].type));
+  Serial.println("]: collecting samples");
   for(uint8_t i=0;i<CAL_SAMPLES;i++) {
     delay(CAL_DELAY_MS);
     uint16_t mm;
     if(readMmPermissive(ch,mm) && mm>=chs[ch].minValid && mm<2000)
       samples[cnt++]=mm;
+    else
+      rejected++;
   }
+  Serial.print("CAL CH"); Serial.print(ch);
+  Serial.print(": valid="); Serial.print(cnt);
+  Serial.print(" rejected="); Serial.println(rejected);
   if (cnt >= 4) {
     sortU16(samples, cnt);
     // Use middle half — discard bottom 25% and top 25% outliers
@@ -260,14 +285,16 @@ static void calibrateChannel(uint8_t ch) {
     if (chs[ch].exitThr >= base) chs[ch].exitThr = base - 2;
 
     Serial.print("CAL CH"); Serial.print(ch);
-    Serial.print(chs[ch].type==ST_VL618?" [VL6180X]":" [VL53L0X]");
+    Serial.print(" ["); Serial.print(sensorTypeName(chs[ch].type)); Serial.print("]");
     Serial.print(": base="); Serial.print(base);
     Serial.print("mm enter<"); Serial.print(chs[ch].enterThr);
     Serial.print("mm exit<"); Serial.println(chs[ch].exitThr);
   } else {
+    chs[ch].ok=false;
+    chs[ch].nearState=false; chs[ch].armed=false;
     chs[ch].enterThr=ENTER_FIXED; chs[ch].exitThr=EXIT_FIXED;
     Serial.print("CAL CH"); Serial.print(ch);
-    Serial.println(": low sample count -> fallback 175/210mm");
+    Serial.println(": low valid sample count -> INACTIVE (check wiring/clear path)");
   }
 }
 
@@ -334,6 +361,16 @@ static void tickSensors() {
     }
     chs[ch].failStreak=0;
     // (no skip for mm<MIN_VL53 — close finger readings are valid, state machine needs them)
+    if (now-chs[ch].lastLogMs>=DIST_LOG_MS) {
+      chs[ch].lastLogMs=now;
+      Serial.print("DIST CH"); Serial.print(ch);
+      Serial.print(" ["); Serial.print(sensorTypeName(chs[ch].type)); Serial.print("]");
+      Serial.print(" mm="); Serial.print(mm);
+      Serial.print(" enter<"); Serial.print(chs[ch].enterThr);
+      Serial.print(" exit<"); Serial.print(chs[ch].exitThr);
+      Serial.print(" state="); Serial.print(chs[ch].nearState ? "NEAR" : "FAR");
+      Serial.print(" armed="); Serial.println(chs[ch].armed ? "Y" : "N");
+    }
 
     bool near = chs[ch].nearState ? (mm<=chs[ch].exitThr) : (mm<=chs[ch].enterThr);
 
@@ -343,12 +380,18 @@ static void tickSensors() {
     if (!chs[ch].nearState && near && chs[ch].nearCnt>=NEAR_STABLE) {
       chs[ch].nearState=true;
       if (chs[ch].armed && now-chs[ch].lastTrigMs>=MIN_TRIG_GAP) {
+        Serial.print("TRIGGER CH"); Serial.print(ch);
+        Serial.print(" mm="); Serial.print(mm);
+        Serial.print(" nearCnt="); Serial.println(chs[ch].nearCnt);
         chs[ch].lastTrigMs=now; chs[ch].armed=false;
         rfSendTrig(ch+1, mm);
       }
     }
     if (chs[ch].nearState && !near && chs[ch].farCnt>=FAR_STABLE) {
       chs[ch].nearState=false; chs[ch].armed=true;
+      Serial.print("REARM CH"); Serial.print(ch);
+      Serial.print(" mm="); Serial.print(mm);
+      Serial.print(" farCnt="); Serial.println(chs[ch].farCnt);
     }
   }
 }
