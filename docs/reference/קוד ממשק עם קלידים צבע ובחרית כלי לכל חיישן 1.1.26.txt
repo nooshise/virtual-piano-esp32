@@ -1,0 +1,1018 @@
+//================= SAFE TFT PINS + 8 KEYS UI + 8x VL6180X + DFPlayer TX-only + 8 NeoPixels =================
+//  כולל:
+//  - מסך ראשי: 8 קלידים
+//  - קליד -> בחירת כלי (8 אייקונים)
+//  - קליד -> הגדרות: בחירת תו/תוף (8 אפשרויות בלבד) + בחירת צבע לכלי
+//  - AUTO SCALE: אם כל הקלידים אותו כלי (לא תופים) -> Do..Do2 אוטומטי, +- ננעל
+//  - COLOR LOCK: צבע הוא לכלי נגינה (גלובלי) וללא כפילויות בין כלים
+//      * צבע תפוס (אדום): בחר אותו -> ואז RELEASE "לוקח" אותו מהכלי שמחזיק אותו ומקצה לכלי הנוכחי
+//      * RELEASE בלי צבע תפוס נבחר: משחרר את הצבע של הכלי הנוכחי
+//  - DFPlayer TX-only יציב
+//  - 8 חיישני VL6180X עם XSHUT ושינוי כתובות (Pololu VL6180X init() הוא void)
+//==========================================================================================================
+
+#include "TFT9341Touch.h"
+#include <Wire.h>
+#include <VL6180X.h>          // Pololu
+#include <Adafruit_NeoPixel.h>
+
+#ifdef ESP32
+  #include <pgmspace.h>
+#else
+  #include <avr/pgmspace.h>
+#endif
+#include <stdio.h>
+
+// ---- BITMAPS ----
+#include "icon_piano.h"
+#include "icon_guitar.h"
+#include "icon_drums.h"
+#include "icon_trumpet.h"
+#include "icon_violin.h"
+#include "icon_accordion.h"
+#include "icon_oud.h"
+#include "icon_fan_fluit.h"
+
+// ---------------- TFT ----------------
+tft9341touch lcd(5, 4, 15, 35);   // cs=5, dc=4, tcs=15, tirq=35  (כמו שעבד לך)
+
+//====================================================================================
+//===============================   EDIT ME (HARDWARE)   =============================
+//====================================================================================
+
+// I2C (VL6180X)
+static const int I2C_SDA = 21;
+static const int I2C_SCL = 22;
+static const uint32_t I2C_CLOCK = 100000;
+
+// XSHUT לכל VL6180X (פינים שלא מתנגשים עם SPI של המסך!)
+static const uint8_t NUM_SENSORS = 8;
+static const int XSHUT_PINS[NUM_SENSORS] = { 13, 12, 14, 27, 26, 33, 32, 2 };
+
+// DFPlayer (TX-only כמו שעבד לך: DF RX <- ESP32 TX17 בלבד)
+HardwareSerial mp3Serial(2);
+#define MP3_RX_PIN 16   // לא מחובר בפועל (רק ל-begin)
+#define MP3_TX_PIN 17   // ESP32 TX -> DFPlayer RX
+
+// NeoPixel
+#define LED_PIN   25
+#define LED_COUNT 8
+static const uint8_t LED_BRIGHTNESS = 80;
+
+//====================================================================================
+//===============================   PARAMETERS (LOGIC)   =============================
+//====================================================================================
+
+static const uint8_t NUM_KEYS = 8;
+
+// מיפוי: קליד שמאלי=0 -> חיישן 0 ... קליד ימני=7 -> חיישן 7
+static const uint8_t SENSOR_FOR_KEYPOS[NUM_KEYS] = { 0,1,2,3,4,5,6,7 };
+
+// Near/Far + יציבות
+static const uint8_t NEAR_ENTER_MM     = 175;
+static const uint8_t NEAR_EXIT_MM      = 205;
+static const uint8_t NEAR_STABLE_READS = 2;
+static const uint8_t FAR_STABLE_READS  = 6;
+
+// DFPlayer
+static const uint8_t  DF_VOLUME       = 22;
+static const uint32_t DF_BOOT_WAIT_MS = 12000;
+static const uint16_t DF_CMD_GAP_MS   = 70;
+
+// Playback
+static const uint32_t PLAY_DURATION_MS = 3000;
+static const uint16_t MIN_RETRIGGER_GAP_MS = 140;
+
+// לכל כלי יש רק 8 אפשרויות (סה"כ 64 קבצים בכרטיס: 8 כלים * 8)
+static const uint8_t TRACKS_PER_INSTRUMENT = 8;
+
+//====================================================================================
+//===============================   COLORS / LABELS   =================================
+//====================================================================================
+
+static const uint8_t  NUM_COLORS = 8;
+static const uint16_t ledColors565[NUM_COLORS] = {
+  0xF800, 0x07E0, 0x001F, 0xFFE0, 0x07FF, 0xF81F, 0xFD20, 0xFFFF
+};
+static const char* ledColorNames[NUM_COLORS] = {
+  "Red","Green","Blue","Yellow","Cyan","Magenta","Orange","White"
+};
+
+Adafruit_NeoPixel strip(LED_COUNT, LED_PIN, NEO_GRB + NEO_KHZ800);
+uint32_t ledNeoColors[NUM_COLORS];
+
+static const char* NOTE_NAMES8[8] = { "Do","Re","Mi","Fa","Sol","La","Si","Do2" };
+static const char* DRUM_NAMES8[8] = { "Kick","Snare","HiHat","Tom","Clap","Crash","Ride","Perc" };
+
+//====================================================================================
+//===============================   INSTRUMENTS   ====================================
+//====================================================================================
+
+enum InstrumentId : uint8_t {
+  INST_PIANO = 0,
+  INST_GUITAR,
+  INST_DRUMS,
+  INST_TRUMPET,
+  INST_VIOLIN,
+  INST_ACCORDION,
+  INST_OUD,
+  INST_FAN,
+  INST_COUNT
+};
+
+struct InstrumentDef {
+  const uint16_t* bitmap;
+  const char* name;
+};
+
+static const InstrumentDef INSTR[INST_COUNT] = {
+  { icon_piano_bitmap,     "Piano"     },
+  { icon_guitar_bitmap,    "Guitar"    },
+  { icon_drums_bitmap,     "Drums"     },
+  { icon_trumpet_bitmap,   "Trumpet"   },
+  { icon_violin_bitmap,    "Violin"    },
+  { icon_accordion_bitmap, "Accordion" },
+  { icon_oud_bitmap,       "Oud"       },
+  { icon_fan_fluit_bitmap, "Fan"       }
+};
+
+//====================================================================================
+//===============================   COLOR LOCK (INSTRUMENT)  =========================
+//====================================================================================
+
+static const uint8_t NO_COLOR = 255;
+// צבע לכלי נגינה (גלובלי): 0..7 או 255=אין צבע
+uint8_t instrumentColor[INST_COUNT];
+
+static uint8_t getInstrumentColorOrNone(uint8_t inst) {
+  if (inst >= INST_COUNT) return NO_COLOR;
+  return instrumentColor[inst];
+}
+
+// מי הבעלים של צבע מסוים (255 אם פנוי)
+static uint8_t getColorOwner(uint8_t colorIndex) {
+  for (uint8_t i = 0; i < INST_COUNT; i++) {
+    if (instrumentColor[i] == colorIndex) return i;
+  }
+  return 255;
+}
+
+// האם צבע פנוי (לא משויך לכלי אחר)
+static bool isColorFreeFor(uint8_t colorIndex, uint8_t forInstrument) {
+  for (uint8_t i = 0; i < INST_COUNT; i++) {
+    if (i == forInstrument) continue;
+    if (instrumentColor[i] == colorIndex) return false;
+  }
+  return true;
+}
+
+//====================================================================================
+//===============================   KEY CONFIG   =====================================
+//====================================================================================
+
+struct KeyConfig {
+  uint8_t instrumentId; // 0..7
+  uint8_t choiceIndex;  // 0..7 (Note or Drum type)
+};
+KeyConfig keys[NUM_KEYS];
+
+//====================================================================================
+//===============================   SENSORS STATE   ==================================
+//====================================================================================
+
+VL6180X sensors[NUM_SENSORS];
+bool sensor_ok[NUM_SENSORS] = { false };
+
+bool nearState[NUM_SENSORS] = { false };
+uint8_t nearStableCount[NUM_SENSORS] = { 0 };
+uint8_t farStableCount[NUM_SENSORS]  = { 0 };
+bool armedForTrigger[NUM_SENSORS]    = { true };
+
+static uint32_t lastReadMs[NUM_SENSORS] = { 0 };
+
+// ניגון מונופוני (נגן אחד): קליד פעיל
+bool playerBusy = false;
+int8_t busyKeyPos = -1;
+uint8_t busySensorIdx = 0;
+uint32_t playStartMs = 0;
+uint32_t lastPlayCmdMs = 0;
+
+//====================================================================================
+//===============================   DFPLAYER TX-only RAW   ===========================
+//====================================================================================
+
+// Frame: 0x7E 0xFF 0x06 CMD 0x00 DH DL CHK_H CHK_L 0xEF
+static void dfSend(uint8_t cmd, uint16_t param) {
+  const uint8_t ver = 0xFF;
+  const uint8_t len = 0x06;
+  const uint8_t fb  = 0x00;
+
+  uint8_t dh = (param >> 8) & 0xFF;
+  uint8_t dl = (param     ) & 0xFF;
+
+  uint16_t sum = (uint16_t)ver + len + cmd + fb + dh + dl;
+  uint16_t chk = (uint16_t)(0xFFFF - sum + 1);
+
+  uint8_t frame[10] = {
+    0x7E, ver, len, cmd, fb, dh, dl,
+    (uint8_t)((chk >> 8) & 0xFF),
+    (uint8_t)( chk       & 0xFF),
+    0xEF
+  };
+  mp3Serial.write(frame, 10);
+}
+
+static void dfSelectTF() { dfSend(0x09, 0x0002); }
+static void dfSetVolume(uint8_t v) { if (v > 30) v = 30; dfSend(0x06, v); }
+static void dfStop() { dfSend(0x16, 0x0000); }
+
+static void dfPlayMp3Folder(uint16_t n) { if (n < 1) n = 1; dfSend(0x12, n); }
+static void dfPlayGlobal(uint16_t n)    { if (n < 1) n = 1; dfSend(0x03, n); }
+
+static void dfStopSafe() {
+  dfStop(); delay(DF_CMD_GAP_MS);
+  dfStop();
+}
+
+static void dfPlaySafe(uint16_t n) {
+  dfStop();
+  delay(DF_CMD_GAP_MS);
+
+  dfPlayMp3Folder(n);
+  delay(DF_CMD_GAP_MS + 80);
+
+  dfPlayGlobal(n);
+  delay(DF_CMD_GAP_MS);
+}
+
+static void initDFPlayer_TXonly() {
+  mp3Serial.begin(9600, SERIAL_8N1, MP3_RX_PIN, MP3_TX_PIN);
+
+  Serial.print("DFPlayer boot/index wait ");
+  Serial.print(DF_BOOT_WAIT_MS);
+  Serial.println(" ms...");
+  delay(DF_BOOT_WAIT_MS);
+
+  dfSelectTF();    delay(DF_CMD_GAP_MS);
+  dfSetVolume(DF_VOLUME); delay(DF_CMD_GAP_MS);
+  dfStopSafe();    delay(DF_CMD_GAP_MS);
+
+  Serial.println("DFPlayer TX-only: ready (assume OK)");
+}
+
+//====================================================================================
+//===============================   HELPERS   ========================================
+//====================================================================================
+
+static uint32_t color565ToNeo(uint16_t c) {
+  uint8_t r5 = (c >> 11) & 0x1F;
+  uint8_t g6 = (c >> 5)  & 0x3F;
+  uint8_t b5 =  c        & 0x1F;
+
+  uint8_t r8 = (r5 * 527 + 23) >> 6;
+  uint8_t g8 = (g6 * 259 + 33) >> 6;
+  uint8_t b8 = (b5 * 527 + 23) >> 6;
+
+  return strip.Color(r8, g8, b8);
+}
+
+static void drawBitmap565(int x, int y, int w, int h, const uint16_t *data) {
+  for (int j = 0; j < h; j++) {
+    for (int i = 0; i < w; i++) {
+      uint16_t color = pgm_read_word(&data[j * w + i]);
+      lcd.drawPixel(x + i, y + j, color);
+    }
+  }
+}
+
+static void waitForRelease() {
+  while (lcd.touched()) delay(10);
+  delay(50);
+}
+
+static bool i2cPing(uint8_t addr) {
+  Wire.beginTransmission(addr);
+  return (Wire.endTransmission() == 0);
+}
+
+static uint8_t sensorIndexForKeyPos(uint8_t keyPos) {
+  if (keyPos >= NUM_KEYS) return 0;
+  return SENSOR_FOR_KEYPOS[keyPos];
+}
+
+static void setLed(uint8_t keyPos, bool on) {
+  if (LED_COUNT == 0) return;
+  if (keyPos >= LED_COUNT) keyPos = 0;
+
+  if (!on) {
+    strip.setPixelColor(keyPos, 0);
+    strip.show();
+    return;
+  }
+
+  uint8_t inst = keys[keyPos].instrumentId;
+  uint8_t ci = getInstrumentColorOrNone(inst);
+  if (ci == NO_COLOR) {
+    strip.setPixelColor(keyPos, 0);
+    strip.show();
+    return;
+  }
+
+  strip.setPixelColor(keyPos, ledNeoColors[ci % NUM_COLORS]);
+  strip.show();
+}
+
+// track mapping: /MP3/0001..0064, 8 tracks לכל כלי
+// Piano=1..8, Guitar=9..16, Drums=17..24, ...
+static uint16_t trackForInstrumentChoice(uint8_t inst, uint8_t choice0to7) {
+  if (inst >= INST_COUNT) inst = 0;
+  choice0to7 &= 0x07;
+  return (uint16_t)inst * TRACKS_PER_INSTRUMENT + (uint16_t)choice0to7 + 1; // 1..64
+}
+
+//====================================================================================
+//===============================   AUTO SCALE   =====================================
+//====================================================================================
+
+bool autoKeyboardActive = false;
+uint8_t autoInstrumentId = 0;
+
+static void updateAutoKeyboardMode() {
+  uint8_t inst0 = keys[0].instrumentId;
+  for (uint8_t k = 1; k < NUM_KEYS; k++) {
+    if (keys[k].instrumentId != inst0) { autoKeyboardActive = false; return; }
+  }
+  if (inst0 == INST_DRUMS) { autoKeyboardActive = false; return; }
+  autoKeyboardActive = true;
+  autoInstrumentId = inst0;
+}
+
+static uint8_t effectiveChoiceForKey(uint8_t keyPos) {
+  if (autoKeyboardActive) return keyPos & 0x07;   // Do..Do2 משמאל לימין
+  return keys[keyPos].choiceIndex & 0x07;
+}
+
+//====================================================================================
+//===============================   UI   =============================================
+//====================================================================================
+
+enum ScreenMode { SCREEN_MAIN, SCREEN_PICK_INSTR, SCREEN_KEY_CONFIG, SCREEN_PICK_COLOR };
+ScreenMode currentScreen = SCREEN_MAIN;
+
+uint8_t selectedKeyPos = 0;
+uint8_t colorPickInstrument = 0;
+
+// NEW: זוכר צבע תפוס שנבחר כדי ש-RELEASE ידע איזה צבע "לקחת"
+uint8_t pendingTakeColor = NO_COLOR;
+uint8_t pendingTakeOwner = 255;
+
+// Button IDs חייבים להיות קטנים (1..7) כדי לעבוד אצלך
+static const int BTN_BACK    = 1;
+static const int BTN_MINUS   = 2;
+static const int BTN_PLUS    = 3;
+static const int BTN_INSTR   = 4;
+static const int BTN_RELEASE = 5;
+
+// Keyboard area
+static const int KB_X0 = 10;
+static const int KB_Y0 = 60;
+static const int KB_W  = 300;
+static const int KB_H  = 140;
+int keyX[NUM_KEYS];
+int keyW[NUM_KEYS];
+
+static void calcKeyboardLayout() {
+  int base = KB_W / NUM_KEYS;
+  int rem  = KB_W % NUM_KEYS;
+  int x = KB_X0;
+  for (uint8_t i = 0; i < NUM_KEYS; i++) {
+    int w = base + ((i < rem) ? 1 : 0);
+    keyX[i] = x;
+    keyW[i] = w;
+    x += w;
+  }
+}
+
+static int hitTestKeyByXY(int16_t tx, int16_t ty) {
+  if (ty < KB_Y0 || ty > (KB_Y0 + KB_H)) return -1;
+  if (tx < KB_X0 || tx > (KB_X0 + KB_W)) return -1;
+  for (uint8_t i = 0; i < NUM_KEYS; i++) {
+    if (tx >= keyX[i] && tx < (keyX[i] + keyW[i])) return i;
+  }
+  return -1;
+}
+
+static void drawSingleKey(uint8_t keyPos) {
+  uint8_t inst = keys[keyPos].instrumentId;
+  uint8_t ci = getInstrumentColorOrNone(inst);
+
+  uint16_t bar = (ci == NO_COLOR) ? DARKGREY : ledColors565[ci % NUM_COLORS];
+
+  int x = keyX[keyPos], w = keyW[keyPos], y = KB_Y0, h = KB_H;
+
+  lcd.fillRect(x, y, w, h, WHITE);
+  lcd.drawRect(x, y, w, h, BLACK);
+
+  lcd.fillRect(x+1, y+1, w-2, 6, bar);
+  lcd.drawRect(x+1, y+1, w-2, 6, BLACK);
+
+  lcd.fillRect(x+2, y+12, w-4, 14, WHITE);
+  lcd.print(x+2, y+12, (char*)INSTR[inst].name, 1, BLACK, WHITE);
+
+  uint8_t ch = effectiveChoiceForKey(keyPos);
+  const char* label = (inst == INST_DRUMS) ? DRUM_NAMES8[ch] : NOTE_NAMES8[ch];
+  lcd.fillRect(x+2, y+h-14, w-4, 12, WHITE);
+  lcd.print(x+2, y+h-14, (char*)label, 1, BLACK, WHITE);
+}
+
+static void drawMainScreen() {
+  updateAutoKeyboardMode();
+  calcKeyboardLayout();
+
+  lcd.fillScreen(BLACK);
+  lcd.print(10, 10, "VIRTUAL PIANO (8 KEYS)", 2, YELLOW, BLACK);
+
+  if (autoKeyboardActive) {
+    char buf[48];
+    snprintf(buf, sizeof(buf), "AUTO: %s", INSTR[autoInstrumentId].name);
+    lcd.print(10, 30, buf, 2, GREEN, BLACK);
+  } else {
+    lcd.print(10, 30, "Tap key -> choose instrument", 1, GREEN, BLACK);
+  }
+
+  lcd.drawRect(KB_X0-2, KB_Y0-2, KB_W+4, KB_H+4, CYAN);
+  for (uint8_t k = 0; k < NUM_KEYS; k++) drawSingleKey(k);
+
+  lcd.print(10, 210, "Instrument color is LOCKED (no duplicates)", 1, CYAN, BLACK);
+}
+
+// Instrument picker grid
+static const int ICON_W = 64;
+static const int ICON_H = 64;
+static const int ICON_COLS = 4;
+
+static void getGridPos(uint8_t idx, int &x, int &y) {
+  uint8_t row = idx / ICON_COLS;
+  uint8_t col = idx % ICON_COLS;
+
+  int marginX = (320 - ICON_COLS * ICON_W) / (ICON_COLS + 1);
+  if (marginX < 5) marginX = 5;
+  int marginY = 18;
+
+  x = marginX + col * (ICON_W + marginX);
+  y = 50 + row * (ICON_H + marginY);
+}
+
+static int hitTestInstrument(int16_t tx, int16_t ty) {
+  for (uint8_t i = 0; i < INST_COUNT; i++) {
+    int x, y;
+    getGridPos(i, x, y);
+    if (tx >= x && tx < x + ICON_W && ty >= y && ty < y + ICON_H) return i;
+  }
+  return -1;
+}
+
+static void drawPickInstrumentScreen(uint8_t keyPos) {
+  lcd.fillScreen(BLACK);
+  char hdr[40];
+  snprintf(hdr, sizeof(hdr), "KEY %d: Pick Instrument", (int)(keyPos + 1));
+  lcd.print(10, 10, hdr, 2, YELLOW, BLACK);
+
+  for (uint8_t i = 0; i < INST_COUNT; i++) {
+    int x, y;
+    getGridPos(i, x, y);
+    uint16_t border = (i == keys[keyPos].instrumentId) ? GREEN : WHITE;
+
+    lcd.drawRect(x - 2, y - 2, ICON_W + 4, ICON_H + 4, border);
+    lcd.fillRect(x, y, ICON_W, ICON_H, DARKGREY);
+    if (INSTR[i].bitmap) drawBitmap565(x, y, ICON_W, ICON_H, INSTR[i].bitmap);
+    lcd.print(x + 2, y + ICON_H + 5, (char*)INSTR[i].name, 1, CYAN, BLACK);
+  }
+
+  lcd.drawButton(BTN_BACK, 110, 220, 100, 30, 4, CYAN, BLACK, "BACK", 2);
+}
+
+// Key config screen
+#define COLOR_BOX_X  240
+#define COLOR_BOX_Y  60
+#define COLOR_BOX_W  50
+#define COLOR_BOX_H  24
+
+static void drawKeyConfigValues(uint8_t keyPos) {
+  updateAutoKeyboardMode();
+
+  KeyConfig &kc = keys[keyPos];
+  uint8_t inst = kc.instrumentId;
+  uint8_t ch   = effectiveChoiceForKey(keyPos);
+
+  lcd.fillRect(10, 40, 220, 20, BLACK);
+  lcd.print(10, 40, (char*)INSTR[inst].name, 2, WHITE, BLACK);
+
+  uint8_t sIdx = sensorIndexForKeyPos(keyPos);
+  char sbuf[32];
+  snprintf(sbuf, sizeof(sbuf), "Sensor: %d", (int)(sIdx + 1));
+  lcd.fillRect(10, 130, 220, 16, BLACK);
+  lcd.print(10, 130, sbuf, 1, GREEN, BLACK);
+
+  lcd.fillRect(10, 148, 260, 24, BLACK);
+  const char* label = (inst == INST_DRUMS) ? DRUM_NAMES8[ch] : NOTE_NAMES8[ch];
+  char buf[48];
+  if (autoKeyboardActive && inst != INST_DRUMS) snprintf(buf, sizeof(buf), "Choice: AUTO %s", label);
+  else                                         snprintf(buf, sizeof(buf), "Choice: %s", label);
+  lcd.print(10, 148, buf, 2, YELLOW, BLACK);
+
+  // color block + status
+  lcd.fillRect(200, 40, 120, 20, BLACK);
+  lcd.print(200, 40, "Color:", 2, WHITE, BLACK);
+
+  uint8_t ci = getInstrumentColorOrNone(inst);
+
+  if (ci == NO_COLOR) {
+    lcd.fillRect(COLOR_BOX_X, COLOR_BOX_Y, COLOR_BOX_W, COLOR_BOX_H, BLACK);
+    lcd.drawRect(COLOR_BOX_X - 1, COLOR_BOX_Y - 1, COLOR_BOX_W + 2, COLOR_BOX_H + 2, WHITE);
+    lcd.print(COLOR_BOX_X + 5, COLOR_BOX_Y + 5, "NONE", 1, WHITE, BLACK);
+
+    lcd.fillRect(COLOR_BOX_X - 20, COLOR_BOX_Y + COLOR_BOX_H + 2, 120, 16, BLACK);
+    lcd.print(COLOR_BOX_X - 20, COLOR_BOX_Y + COLOR_BOX_H + 2, "No color (tap)", 1, CYAN, BLACK);
+  } else {
+    uint16_t col = ledColors565[ci % NUM_COLORS];
+    lcd.fillRect(COLOR_BOX_X, COLOR_BOX_Y, COLOR_BOX_W, COLOR_BOX_H, col);
+    lcd.drawRect(COLOR_BOX_X - 1, COLOR_BOX_Y - 1, COLOR_BOX_W + 2, COLOR_BOX_H + 2, WHITE);
+
+    lcd.fillRect(COLOR_BOX_X - 20, COLOR_BOX_Y + COLOR_BOX_H + 2, 120, 16, BLACK);
+    lcd.print(COLOR_BOX_X - 20, COLOR_BOX_Y + COLOR_BOX_H + 2, (char*)ledColorNames[ci], 1, CYAN, BLACK);
+  }
+
+  lcd.fillRect(200, 120, 120, 16, BLACK);
+  lcd.print(200, 120, "Tap color to pick", 1, GREEN, BLACK);
+}
+
+static void drawKeyConfigScreen(uint8_t keyPos) {
+  lcd.fillScreen(BLACK);
+
+  char hdr[24];
+  snprintf(hdr, sizeof(hdr), "KEY %d CONFIG", (int)(keyPos + 1));
+  lcd.print(10, 10, hdr, 2, YELLOW, BLACK);
+
+  uint8_t inst = keys[keyPos].instrumentId;
+  lcd.fillRect(10, 60, ICON_W, ICON_H, DARKGREY);
+  if (INSTR[inst].bitmap) drawBitmap565(10, 60, ICON_W, ICON_H, INSTR[inst].bitmap);
+  lcd.drawRect(8, 58, ICON_W + 4, ICON_H + 4, WHITE);
+
+  drawKeyConfigValues(keyPos);
+
+  updateAutoKeyboardMode();
+  bool lockChoice = (autoKeyboardActive && (inst != INST_DRUMS));
+
+  uint16_t minusCol = lockChoice ? DARKGREY : RED;
+  uint16_t plusCol  = lockChoice ? DARKGREY : GREEN;
+
+  lcd.drawButton(BTN_MINUS,  10, 180, 60, 30, 3, minusCol, WHITE, "-", 2);
+  lcd.drawButton(BTN_PLUS,   80, 180, 60, 30, 3, plusCol,  WHITE, "+", 2);
+  lcd.drawButton(BTN_INSTR, 160, 180, 150, 30, 3, WHITE,  BLACK, "INSTRUMENT", 1);
+  lcd.drawButton(BTN_BACK,  110, 220, 100, 30, 4, CYAN,   BLACK, "BACK", 2);
+
+  lcd.print(10, 205, "Color is per-instrument (LOCK)", 1, GREEN, BLACK);
+}
+
+// ---------------- COLOR PICKER SCREEN ----------------
+static const int CP_BOX_W = 60;
+static const int CP_BOX_H = 40;
+
+static void cpGetPos(uint8_t idx, int &x, int &y) {
+  uint8_t row = idx / 4;
+  uint8_t col = idx % 4;
+  int marginX = 10;
+  int marginY = 12;
+  x = 10 + col * (CP_BOX_W + marginX);
+  y = 60 + row * (CP_BOX_H + marginY);
+}
+
+static int hitTestColorBox(int16_t tx, int16_t ty) {
+  for (uint8_t i = 0; i < NUM_COLORS; i++) {
+    int x, y;
+    cpGetPos(i, x, y);
+    if (tx >= x && tx < x + CP_BOX_W && ty >= y && ty < y + CP_BOX_H) return i;
+  }
+  return -1;
+}
+
+static void showColorMsg(const char* msg) {
+  // שורה מעל הכפתורים (לא מתנגשת)
+  lcd.fillRect(10, 190, 300, 14, BLACK);
+  lcd.print(10, 190, (char*)msg, 1, YELLOW, BLACK);
+}
+
+static void drawColorPickerScreen(uint8_t instrumentId) {
+  pendingTakeColor = NO_COLOR;
+  pendingTakeOwner = 255;
+
+  lcd.fillScreen(BLACK);
+
+  char hdr[48];
+  snprintf(hdr, sizeof(hdr), "Pick Color for %s", INSTR[instrumentId].name);
+  lcd.print(10, 10, hdr, 2, YELLOW, BLACK);
+
+  lcd.print(10, 32, "Green=Selected  Red=In use  White=Free", 1, CYAN, BLACK);
+
+  uint8_t current = getInstrumentColorOrNone(instrumentId);
+
+  for (uint8_t c = 0; c < NUM_COLORS; c++) {
+    int x, y;
+    cpGetPos(c, x, y);
+
+    uint8_t owner = getColorOwner(c);
+    bool selected = (current != NO_COLOR && current == c);
+
+    uint16_t border = WHITE;
+    if (selected) border = GREEN;
+    else if (owner != 255 && owner != instrumentId) border = RED;
+
+    lcd.fillRect(x, y, CP_BOX_W, CP_BOX_H, ledColors565[c]);
+    lcd.drawRect(x - 2, y - 2, CP_BOX_W + 4, CP_BOX_H + 4, border);
+
+    // name
+    lcd.fillRect(x, y + CP_BOX_H + 2, CP_BOX_W, 12, BLACK);
+    lcd.print(x, y + CP_BOX_H + 2, (char*)ledColorNames[c], 1, WHITE, BLACK);
+
+    // אם תפוס - להראות מי מחזיק (קטן, יפה)
+    if (owner != 255 && owner != instrumentId) {
+      lcd.fillRect(x+2, y+2, CP_BOX_W-4, 10, BLACK);
+      lcd.print(x+2, y+2, (char*)INSTR[owner].name, 1, WHITE, BLACK);
+    }
+  }
+
+  // כפתורים הועלו למעלה כדי שלא ייחתכו
+  lcd.drawButton(BTN_RELEASE, 10, 205, 140, 30, 3, RED, WHITE, "RELEASE", 2);
+  lcd.drawButton(BTN_BACK,    170, 205, 140, 30, 3, CYAN, BLACK, "BACK", 2);
+
+  showColorMsg("Tip: tap a red color, then RELEASE to take it");
+}
+
+//====================================================================================
+//===============================   TOUCH HANDLERS   =================================
+//====================================================================================
+
+static void handleMainTouch() {
+  if (!lcd.touched()) return;
+  delay(30);
+  lcd.readTouch();
+  int16_t x = lcd.xTouch, y = lcd.yTouch;
+
+  int kp = hitTestKeyByXY(x, y);
+  if (kp >= 0) {
+    selectedKeyPos = (uint8_t)kp;
+    drawPickInstrumentScreen(selectedKeyPos);
+    currentScreen = SCREEN_PICK_INSTR;
+  }
+  waitForRelease();
+}
+
+static void handlePickInstrumentTouch() {
+  if (!lcd.touched()) return;
+  delay(30);
+  lcd.readTouch();
+  int16_t x = lcd.xTouch, y = lcd.yTouch;
+
+  int8_t btn = lcd.ButtonTouch(x, y);
+  if (btn == BTN_BACK) {
+    drawMainScreen();
+    currentScreen = SCREEN_MAIN;
+    waitForRelease();
+    return;
+  }
+
+  int inst = hitTestInstrument(x, y);
+  if (inst >= 0) {
+    keys[selectedKeyPos].instrumentId = (uint8_t)inst;
+    keys[selectedKeyPos].choiceIndex = 0; // ברירת מחדל (Do או Kick)
+    updateAutoKeyboardMode();
+    drawKeyConfigScreen(selectedKeyPos);
+    currentScreen = SCREEN_KEY_CONFIG;
+  }
+  waitForRelease();
+}
+
+static void handleKeyConfigTouch() {
+  if (!lcd.touched()) return;
+  delay(30);
+  lcd.readTouch();
+  int16_t x = lcd.xTouch, y = lcd.yTouch;
+
+  KeyConfig &kc = keys[selectedKeyPos];
+
+  // tap color box -> open color picker for THIS instrument
+  if (x >= COLOR_BOX_X && x <= (COLOR_BOX_X + COLOR_BOX_W) &&
+      y >= COLOR_BOX_Y && y <= (COLOR_BOX_Y + COLOR_BOX_H)) {
+    colorPickInstrument = kc.instrumentId;
+    drawColorPickerScreen(colorPickInstrument);
+    currentScreen = SCREEN_PICK_COLOR;
+    waitForRelease();
+    return;
+  }
+
+  int8_t btn = lcd.ButtonTouch(x, y);
+  if (btn <= 0) { waitForRelease(); return; }
+
+  if (btn == BTN_BACK) {
+    drawMainScreen();
+    currentScreen = SCREEN_MAIN;
+    waitForRelease();
+    return;
+  }
+
+  if (btn == BTN_INSTR) {
+    drawPickInstrumentScreen(selectedKeyPos);
+    currentScreen = SCREEN_PICK_INSTR;
+    waitForRelease();
+    return;
+  }
+
+  updateAutoKeyboardMode();
+  bool lockChoice = (autoKeyboardActive && (kc.instrumentId != INST_DRUMS));
+
+  if (!lockChoice) {
+    if (btn == BTN_MINUS) {
+      kc.choiceIndex = (kc.choiceIndex == 0) ? 7 : (kc.choiceIndex - 1);
+      drawKeyConfigValues(selectedKeyPos);
+    } else if (btn == BTN_PLUS) {
+      kc.choiceIndex = (kc.choiceIndex + 1) & 0x07;
+      drawKeyConfigValues(selectedKeyPos);
+    }
+  }
+
+  waitForRelease();
+}
+
+static void handleColorPickerTouch() {
+  if (!lcd.touched()) return;
+  delay(30);
+  lcd.readTouch();
+  int16_t x = lcd.xTouch, y = lcd.yTouch;
+
+  int8_t btn = lcd.ButtonTouch(x, y);
+
+  if (btn == BTN_BACK) {
+    drawKeyConfigScreen(selectedKeyPos);
+    currentScreen = SCREEN_KEY_CONFIG;
+    waitForRelease();
+    return;
+  }
+
+  if (btn == BTN_RELEASE) {
+    // אם נבחר צבע תפוס -> "לוקחים" אותו: משחררים מהבעלים ומקצים לכלי הנוכחי
+    if (pendingTakeColor != NO_COLOR && pendingTakeOwner != 255 && pendingTakeOwner < INST_COUNT) {
+      instrumentColor[pendingTakeOwner] = NO_COLOR;
+      instrumentColor[colorPickInstrument] = pendingTakeColor;
+
+      pendingTakeColor = NO_COLOR;
+      pendingTakeOwner = 255;
+
+      drawColorPickerScreen(colorPickInstrument); // רענון מיידי (האדום ייעלם)
+      showColorMsg("Released + Assigned to current instrument");
+      waitForRelease();
+      return;
+    }
+
+    // אחרת: RELEASE רגיל = לשחרר את הצבע של הכלי הנוכחי
+    instrumentColor[colorPickInstrument] = NO_COLOR;
+    drawColorPickerScreen(colorPickInstrument);
+    showColorMsg("Color released for current instrument");
+    waitForRelease();
+    return;
+  }
+
+  int c = hitTestColorBox(x, y);
+  if (c >= 0) {
+    uint8_t current = getInstrumentColorOrNone(colorPickInstrument);
+    uint8_t owner = getColorOwner((uint8_t)c);
+
+    // אם זה כבר הצבע הנוכחי - אין מה לעשות
+    if (current != NO_COLOR && current == (uint8_t)c) {
+      showColorMsg("Already selected");
+      waitForRelease();
+      return;
+    }
+
+    // אם תפוס ע"י כלי אחר -> לשמור pending ולבקש RELEASE
+    if (owner != 255 && owner != colorPickInstrument) {
+      pendingTakeColor = (uint8_t)c;
+      pendingTakeOwner = owner;
+
+      char msg[80];
+      snprintf(msg, sizeof(msg), "IN USE by %s -> press RELEASE to take it", INSTR[owner].name);
+      showColorMsg(msg);
+      waitForRelease();
+      return;
+    }
+
+    // פנוי / שייך לעצמו -> מקצים מיד
+    instrumentColor[colorPickInstrument] = (uint8_t)c;
+    drawColorPickerScreen(colorPickInstrument);
+    showColorMsg("Color assigned");
+    waitForRelease();
+    return;
+  }
+
+  waitForRelease();
+}
+
+//====================================================================================
+//===============================   SENSOR INIT (POLULU FIX)  ========================
+//====================================================================================
+
+static void initAllSensors() {
+  for (uint8_t i = 0; i < NUM_SENSORS; i++) {
+    pinMode(XSHUT_PINS[i], OUTPUT);
+    digitalWrite(XSHUT_PINS[i], LOW);
+  }
+  delay(80);
+
+  for (uint8_t i = 0; i < NUM_SENSORS; i++) {
+    digitalWrite(XSHUT_PINS[i], HIGH);
+    delay(25);
+
+    bool seen = false;
+    for (uint8_t r = 0; r < 6; r++) {
+      if (i2cPing(0x29)) { seen = true; break; }
+      delay(20);
+    }
+    if (!seen) {
+      sensor_ok[i] = false;
+      Serial.print("VL #"); Serial.print(i+1);
+      Serial.println(" NOT responding @0x29");
+      continue;
+    }
+
+    sensors[i].setTimeout(80);
+    sensors[i].init();              // void
+    sensors[i].configureDefault();
+
+    uint8_t newAddr = 0x29 + i;
+    sensors[i].setAddress(newAddr);
+    delay(5);
+
+    if (!i2cPing(newAddr)) {
+      sensor_ok[i] = false;
+      Serial.print("VL #"); Serial.print(i+1);
+      Serial.print(" setAddress FAILED @0x"); Serial.println(newAddr, HEX);
+      continue;
+    }
+
+    sensors[i].startRangeContinuous(50);
+    sensor_ok[i] = true;
+
+    Serial.print("VL #"); Serial.print(i+1);
+    Serial.print(" OK @0x"); Serial.println(newAddr, HEX);
+  }
+}
+
+//====================================================================================
+//===============================   SOUND + LED   ====================================
+//====================================================================================
+
+static void stopPlaybackNow() {
+  dfStopSafe();
+  if (busyKeyPos >= 0) setLed((uint8_t)busyKeyPos, false);
+  playerBusy = false;
+  busyKeyPos = -1;
+}
+
+static void updateAllSensorsAndSound() {
+  updateAutoKeyboardMode();
+
+  if (playerBusy && (millis() - playStartMs >= PLAY_DURATION_MS)) {
+    stopPlaybackNow();
+  }
+
+  for (uint8_t keyPos = 0; keyPos < NUM_KEYS; keyPos++) {
+    uint8_t sIdx = sensorIndexForKeyPos(keyPos);
+    if (sIdx >= NUM_SENSORS) continue;
+    if (!sensor_ok[sIdx]) continue;
+
+    if (millis() - lastReadMs[sIdx] < 60) continue;
+    lastReadMs[sIdx] = millis();
+
+    uint16_t range = sensors[sIdx].readRangeContinuousMillimeters();
+    bool timeout = sensors[sIdx].timeoutOccurred();
+    bool valid = (!timeout && range != 65535);
+
+    bool nearNow = false;
+    if (valid) {
+      if (!nearState[sIdx]) nearNow = (range <= NEAR_ENTER_MM);
+      else                  nearNow = (range <= NEAR_EXIT_MM);
+    } else {
+      nearNow = false;
+    }
+
+    if (nearNow) {
+      nearStableCount[sIdx] = (nearStableCount[sIdx] < 255) ? (nearStableCount[sIdx] + 1) : 255;
+      farStableCount[sIdx]  = 0;
+    } else {
+      farStableCount[sIdx]  = (farStableCount[sIdx] < 255) ? (farStableCount[sIdx] + 1) : 255;
+      nearStableCount[sIdx] = 0;
+    }
+
+    if (!nearState[sIdx] && nearNow && nearStableCount[sIdx] >= NEAR_STABLE_READS) nearState[sIdx] = true;
+    if (nearState[sIdx] && !nearNow && farStableCount[sIdx] >= FAR_STABLE_READS)  nearState[sIdx] = false;
+
+    if (!nearState[sIdx] && farStableCount[sIdx] >= FAR_STABLE_READS) armedForTrigger[sIdx] = true;
+
+    if (armedForTrigger[sIdx] && nearState[sIdx]) {
+      if (millis() - lastPlayCmdMs < MIN_RETRIGGER_GAP_MS) {
+        armedForTrigger[sIdx] = false;
+        continue;
+      }
+
+      uint8_t inst = keys[keyPos].instrumentId;
+      uint8_t ch   = effectiveChoiceForKey(keyPos);
+      uint16_t track = trackForInstrumentChoice(inst, ch);
+
+      if (playerBusy) stopPlaybackNow();
+
+      dfPlaySafe(track);
+      lastPlayCmdMs = millis();
+
+      setLed(keyPos, true);
+
+      playerBusy = true;
+      busyKeyPos = (int8_t)keyPos;
+      busySensorIdx = sIdx;
+      playStartMs = millis();
+      armedForTrigger[sIdx] = false;
+
+      Serial.print("TRIG key "); Serial.print(keyPos+1);
+      Serial.print(" inst "); Serial.print(INSTR[inst].name);
+      Serial.print(" choice "); Serial.print(ch);
+      Serial.print(" track "); Serial.println(track);
+    }
+  }
+}
+
+//====================================================================================
+//===============================   SETUP / LOOP   ===================================
+//====================================================================================
+
+void setup() {
+  Serial.begin(115200);
+  delay(400);
+  Serial.println();
+  Serial.println("=== SAFE TFT PINS + 8 KEYS + COLOR LOCK PER INSTRUMENT (TAKE COLOR FIX) ===");
+
+  // TFT קודם
+  lcd.begin();
+  lcd.setTouch(3780, 372, 489, 3811);
+  lcd.fillScreen(BLACK);
+  lcd.print(10, 10, "BOOT...", 2, YELLOW, BLACK);
+
+  // defaults keys
+  for (uint8_t k = 0; k < NUM_KEYS; k++) {
+    keys[k].instrumentId = INST_PIANO;
+    keys[k].choiceIndex  = k & 0x07;
+  }
+
+  // defaults instrument colors: ייחודי לכל כלי (ועדיין ניתן לשינוי/שחרור)
+  for (uint8_t i = 0; i < INST_COUNT; i++) {
+    instrumentColor[i] = i % NUM_COLORS;  // 0..7 unique
+  }
+
+  // NeoPixel
+  strip.begin();
+  strip.setBrightness(LED_BRIGHTNESS);
+  strip.clear(); strip.show();
+  for (uint8_t i = 0; i < NUM_COLORS; i++) ledNeoColors[i] = color565ToNeo(ledColors565[i]);
+
+  // I2C
+  Wire.begin(I2C_SDA, I2C_SCL);
+  Wire.setClock(I2C_CLOCK);
+  delay(80);
+
+  lcd.print(10, 30, "Init sensors...", 1, GREEN, BLACK);
+  initAllSensors();
+
+  lcd.print(10, 45, "Init DFPlayer...", 1, GREEN, BLACK);
+  initDFPlayer_TXonly();
+
+  // init states
+  for (uint8_t i = 0; i < NUM_SENSORS; i++) {
+    nearState[i] = false;
+    armedForTrigger[i] = true;
+    nearStableCount[i] = 0;
+    farStableCount[i] = 0;
+    lastReadMs[i] = 0;
+  }
+  playerBusy = false;
+  busyKeyPos = -1;
+
+  drawMainScreen();
+}
+
+void loop() {
+  if (currentScreen == SCREEN_MAIN) handleMainTouch();
+  else if (currentScreen == SCREEN_PICK_INSTR) handlePickInstrumentTouch();
+  else if (currentScreen == SCREEN_KEY_CONFIG) handleKeyConfigTouch();
+  else handleColorPickerTouch();
+
+  updateAllSensorsAndSound();
+  delay(0);
+}
