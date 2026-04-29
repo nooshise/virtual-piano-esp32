@@ -1,74 +1,126 @@
-# סקירת ארכיטקטורה
+# Architecture Overview
 
-הפרויקט בנוי משני לוחות ESP32 נפרדים. כל לוח מריץ סקיצת Arduino עצמאית, עם אחריות שונה וברורה.
+The project uses two separate ESP32 boards and two separate Arduino sketches. The sketches must stay separate because they run on different hardware.
 
-## עקרון מרכזי
+## UI / Sound Board
 
-אין למזג את שתי הסקיצות. ההפרדה בין לוח ה-UI ללוח החיישנים היא חלק מהארכיטקטורה של הפרויקט.
+Sketch folder: `instrument_config/`
 
-## לוח UI
+Responsibilities:
 
-סקיצה: `instrument_config/instrument_config.ino`
+- Draw the TFT UI.
+- Read STMPE610 touch through the installed `tft_touch_ESP_UNO _V3` library.
+- Configure 8 virtual keys: instrument, note, and color.
+- Receive `T,<key>,<mm>` trigger messages from the sensor board.
+- Calculate tracks with `track = instrumentId * 8 + noteIndex + 1`.
+- Play the matching DFPlayer Mini module.
+- Send `C,<key>,<colorIdx>` LED color updates to the sensor board.
 
-אחריות:
+Current module map:
 
-- הצגת ממשק משתמש במסך TFT מגע.
-- שימוש בספריית `TFT9341Touch`.
-- טעינת אייקוני כלי נגינה מקבצי `.h`.
-- בחירת כלי, תו וצבע לכל מקש.
-- קבלת טריגרים מלוח החיישנים.
-- שליחת צבעים/הגדרות ללוח החיישנים.
-- הפעלת `DFPlayer` להשמעת קבצי קול.
+| File | Responsibility |
+|---|---|
+| `instrument_config.ino` | Arduino `setup()` / `loop()` entry point |
+| `ProjectConfig.h` | UI board pins, counts, colors, RF and DF constants |
+| `UIState.h` | screen enum and key configuration state |
+| `Instruments.h` | instrument, note, and color names |
+| `Icons.h` | references to the existing icon bitmap headers |
+| `TrackMap.h` | SD root track formula |
+| `DFPlayers.cpp/.h` | DFPlayer serial initialization and playback command frames |
+| `RFProtocol.cpp/.h` | HC-12 receive/send protocol handling |
+| `UIDraw.cpp/.h` | main screen, key config, instrument picker, color picker |
+| `UITouch.cpp/.h` | simple touch read flow and navigation |
+| `icon_*.h` | existing bitmap data, not edited by the refactor |
 
-קבצים קשורים:
+Touch wiring:
 
-- `instrument_config/TFT9341Touch.h`
-- `instrument_config/IconConfig.h`
-- `instrument_config/icon_*.h`
+- TFT CS: `GPIO5`
+- TFT DC: `GPIO4`
+- Touch CS: `GPIO15`
+- Touch IRQ: `GPIO35`
 
-## לוח חיישנים
+Touch calibration:
 
-סקיצה: `SENS_FIXED/SENS_FIXED.ino`
+```cpp
+lcd.setTouch(3780, 372, 489, 3811);
+```
 
-אחריות:
+## Sensor Board
 
-- קריאת חיישני ToF.
-- תמיכה בחיישני `VL53L0X` ו-`VL6180X`.
-- בחירת ערוץ דרך `TCA9548A`.
-- כיול מרחקי בסיס וספי טריגר.
-- שליחת אירועי נגינה ללוח ה-UI.
-- קבלת צבעים מלוח ה-UI.
-- הפעלת תאורת LED/NeoPixel לפי טריגרים.
+Sketch folder: `SENS_FIXED/`
 
-## תקשורת בין הלוחות
+Responsibilities:
 
-התקשורת מתבצעת דרך מודול `HC-12` או קישור Serial תואם.
+- Read up to 8 ToF sensors through the TCA9548A I2C mux.
+- Support VL53L0X and VL6180X detection.
+- Calibrate baseline distance and trigger thresholds.
+- Send one-shot trigger messages while preventing repeat triggers while a finger is held.
+- Re-arm only after far exit.
+- Receive LED color commands from the UI board.
+- Drive NeoPixel feedback on `GPIO25`.
 
-פקודות עיקריות:
+Current module map:
 
-| כיוון | פורמט | משמעות |
+| File | Responsibility |
+|---|---|
+| `SENS_FIXED.ino` | Arduino `setup()` / `loop()` entry point |
+| `SensorConfig.h` | sensor board pins, thresholds, timing constants |
+| `TcaMux.cpp/.h` | I2C setup, TCA selection, ping, register read, bus recovery |
+| `ToFSensors.cpp/.h` | sensor init, detection, calibration, reads, recovery |
+| `TriggerState.cpp/.h` | near/far one-shot trigger state machine |
+| `LedStrip.cpp/.h` | NeoPixel colors, trigger flash, calibration animation |
+| `RFProtocol.cpp/.h` | HC-12 `T` send and `C` receive handling |
+| `Diagnostics.cpp/.h` | readable sensor type names for Serial logs |
+
+Sensor wiring:
+
+- I2C SDA: `GPIO21`
+- I2C SCL: `GPIO22`
+- TCA9548A address: `0x70`
+- NeoPixel strip: `GPIO25`
+- HC-12 UART: RX `GPIO34`, TX `GPIO13`, baud `9600`
+
+## RF Protocol
+
+| Direction | Format | Meaning |
 |---|---|---|
-| Sensor -> UI | `T,<key>,<mm>` | טריגר ממקש 1-8 עם מרחק במילימטרים |
-| UI -> Sensor | `C,<key>,<colorIdx>` | צבע LED עבור מקש 1-8 |
-| Sensor -> UI | `BOOT,SENS` | לוח החיישנים הופעל |
-| UI -> Sensor | `BOOT,UI` | לוח ה-UI הופעל |
+| Sensor -> UI | `T,<1..8>,<mm>` | Sensor/key trigger with distance |
+| UI -> Sensor | `C,<1..8>,<colorIdx>` | Set LED color index for one key |
+| Sensor -> UI | `BOOT,SENS` | Sensor board booted |
+| UI -> Sensor | `BOOT,UI` | UI board booted |
 
-## מיפוי כללי
+## SD Track Layout
 
-| תחום | לוח אחראי | קובץ מרכזי |
-|---|---|---|
-| מסך מגע | UI | `instrument_config/instrument_config.ino` |
-| אייקונים | UI | `instrument_config/icon_*.h` |
-| נגינה דרך `DFPlayer` | UI | `instrument_config/instrument_config.ino` |
-| חיישני ToF | Sensor | `SENS_FIXED/SENS_FIXED.ino` |
-| כיול חיישנים | Sensor | `SENS_FIXED/SENS_FIXED.ino` |
-| LED/NeoPixel | Sensor | `SENS_FIXED/SENS_FIXED.ino` |
-| תקשורת `HC-12` | שני הלוחות | שתי הסקיצות |
+Files remain in the SD card root:
 
-## גבולות שינוי
+```text
+001.mp3
+002.mp3
+...
+064.mp3
+```
 
-- שינויי UI צריכים להישאר בתיקיית `instrument_config/`.
-- שינויי חיישנים צריכים להישאר בתיקיית `SENS_FIXED/`.
-- שינויי תקשורת צריכים להיבדק בשני הלוחות.
-- שינוי במיפוי `DFPlayer` חייב לעדכן את טופס מיפוי כרטיס ה-SD.
-- שינוי חיווט חייב לעדכן את טבלת החיבורים.
+Track ranges:
+
+| Instrument | Tracks |
+|---|---|
+| Piano | 001-008 |
+| Guitar | 009-016 |
+| Drums | 017-024 |
+| Trumpet | 025-032 |
+| Violin | 033-040 |
+| Accordion | 041-048 |
+| Oud | 049-056 |
+| Fan Flute | 057-064 |
+
+## Compile Commands
+
+```powershell
+arduino-cli compile --fqbn esp32:esp32:uPesy_wroom --libraries "C:\Users\shash\OneDrive\מסמכים\Arduino\libraries" instrument_config
+arduino-cli compile --fqbn esp32:esp32:uPesy_wroom --libraries "C:\Users\shash\OneDrive\מסמכים\Arduino\libraries" SENS_FIXED
+```
+
+## Current Known Issues
+
+- The modular refactor has compile verification only. Physical TFT, touch, RF, DFPlayer, sensor, and LED tests still need to be run on the two ESP32 boards.
+- The UI intentionally relies on the installed `TFT9341Touch.h`; a local header with the same name must not be reintroduced inside `instrument_config/`.
