@@ -1,12 +1,13 @@
-#pragma once
-// tft9341touch: ILI9341 TFT plus raw SPI resistive touch wrapper.
-// The touch path follows the known-working TFT9341Touch examples: TIRQ is
-// active-low, and X/Y are read directly with ADS/XPT-style SPI commands.
+﻿#pragma once
+// tft9341touch: ILI9341 TFT + STMPE610 touch wrapper
+// TIRQ is active-LOW — do NOT use INPUT_PULLUP.
+// KEY FIX: readTouch() drains entire FIFO (not just 1 entry) to prevent freeze.
 
 #include <Arduino.h>
 #include <SPI.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_ILI9341.h>
+#include <Adafruit_STMPE610.h>
 
 #define TFT_MAX_BUTTONS 10
 
@@ -14,79 +15,88 @@ class tft9341touch : public Adafruit_ILI9341 {
 public:
   int16_t xTouch = 0;
   int16_t yTouch = 0;
-  int16_t xRaw   = 0;
+  int16_t xRaw   = 0;   // last raw STMPE610 X — useful for calibration debug
   int16_t yRaw   = 0;
 
   tft9341touch(uint8_t cs, uint8_t dc, uint8_t tcs, uint8_t tirq)
     : Adafruit_ILI9341(cs, dc),
-      _tftCs(cs),
-      _tcs(tcs),
+      _ts((uint8_t)tcs, &SPI),
       _tirq(tirq)
   {}
 
   bool begin() {
-    pinMode(_tcs, OUTPUT);
-    pinMode(_tirq, INPUT_PULLUP);
-    digitalWrite(_tcs, HIGH);
-
-    pinMode(_tftCs, OUTPUT);
-    digitalWrite(_tftCs, HIGH);
-    SPI.begin();
-
     Adafruit_ILI9341::begin();
-    setRotation(3);       // landscape 320x240 for the project UI
+    setRotation(3);       // landscape 320x240, correct orientation
     fillScreen(0x0000);
 
-    digitalWrite(_tftCs, HIGH);
-    digitalWrite(_tcs, HIGH);
-    _touchOk = true;      // raw SPI touch has no controller init transaction
+    pinMode(_tirq, INPUT);  // active-LOW open-drain; board has pull-up
+
+    _touchOk = _ts.begin();
+    if (_touchOk) {
+      // Drain until TIRQ goes HIGH (hardware signal, never lags unlike FIFO register)
+      uint32_t t0 = millis();
+      while (millis() - t0 < 2000 && digitalRead(_tirq) == LOW) {
+        _ts.getPoint();   // consume one FIFO entry
+        delay(10);
+      }
+    }
     return _touchOk;
   }
 
-  void setTouch(int16_t x1, int16_t x2, int16_t y1, int16_t y2) {
-    _rx1=x1; _rx2=x2; _ry1=y1; _ry2=y2;
+  void setTouch(int16_t x1, int16_t y1, int16_t x2, int16_t y2) {
+    _rx1=x1; _ry1=y1; _rx2=x2; _ry2=y2;
   }
 
+  // TIRQ is active-LOW primary; _ts.touched() (FIFO register) is fallback
+  // in case TIRQ wiring is unreliable on this board.
   bool touched() {
     if (!_touchOk) return false;
-    return digitalRead(_tirq) == LOW;
+    if (digitalRead(_tirq) == LOW) return true;
+    return _ts.touched();   // SPI register fallback
   }
 
+  // Drain the ENTIRE FIFO, map the last valid point to xTouch/yTouch.
+  // KEY FIX: use digitalRead(TIRQ) to detect empty FIFO — the hardware signal
+  // is instant, whereas _ts.touched() reads a SPI register that lags after getPoint().
+  // Using the stale SPI register caused TIRQ to stay LOW permanently → frozen UI.
   void readTouch() {
-    xTouch = -1;
-    yTouch = -1;
-    if (!_touchOk || !touched()) return;
+    if (!_touchOk) return;
+    xTouch = 0; yTouch = 0;  // reset so stale coords are never used if read fails
+    TS_Point last = {0, 0, 0};
+    bool     got  = false;
+    uint8_t  n    = 0;
+    while (n < 16 && (digitalRead(_tirq) == LOW || _ts.touched())) {
+      last = _ts.getPoint();
+      got  = true;
+      n++;
+      delay(2);   // 2ms: gives STMPE610 time to dequeue before checking TIRQ again
+    }
+    if (!got || (last.x == 0 && last.y == 0)) return;
 
-    uint16_t rawX = readStableAxis(0xD0);
-    uint16_t rawY = readStableAxis(0x90);
-    xRaw = (int16_t)rawX;
-    yRaw = (int16_t)rawY;
-    if (rawX == 0 && rawY == 0) return;
+    xRaw = (int16_t)last.x;
+    yRaw = (int16_t)last.y;
 
-    // Match the reference library's default rotation-2 touch transform while
-    // keeping Adafruit_ILI9341 rotation 3 so the existing UI remains landscape.
-    int16_t mappedX = (int16_t)map((long)rawY, (long)_ry1, (long)_ry2,
-                                   10L, (long)(width() - 10));
-    int16_t mappedYBase = (int16_t)map((long)rawX, (long)_rx1, (long)_rx2,
-                                       10L, (long)(height() - 10));
-    int16_t mappedY = (int16_t)((height() - 1) - mappedYBase);
-
-    xTouch = clampToDisplay(mappedX, width());
-    yTouch = clampToDisplay(mappedY, height());
+    int16_t sx = (int16_t)map((long)last.x, (long)_rx1, (long)_rx2, 0L, (long)(width()-1));
+    int16_t sy = (int16_t)map((long)last.y, (long)_ry1, (long)_ry2, 0L, (long)(height()-1));
+    if (sx < 0) sx = 0; if (sx >= (int16_t)width())  sx = width()-1;
+    if (sy < 0) sy = 0; if (sy >= (int16_t)height()) sy = height()-1;
+    xTouch = sx;
+    yTouch = sy;
   }
 
+  // Drain FIFO completely — use TIRQ (hardware, instant) not SPI register (lags)
   void drainFifo() {
-    // The reference touch controller path has no FIFO to drain.
+    if (!_touchOk) return;
+    uint8_t n = 0;
+    while (digitalRead(_tirq) == LOW && n < 32) { _ts.getPoint(); n++; delay(2); }
   }
 
   bool touchOk() { return _touchOk; }
 
   bool readRawPoint(int16_t &rx, int16_t &ry) {
-    if (!_touchOk || !touched()) return false;
-    rx = (int16_t)readStableAxis(0xD0);
-    ry = (int16_t)readStableAxis(0x90);
-    xRaw = rx;
-    yRaw = ry;
+    if (!_touchOk || !_ts.touched()) return false;
+    TS_Point p = _ts.getPoint();
+    rx=(int16_t)p.x; ry=(int16_t)p.y;
     return true;
   }
 
@@ -130,46 +140,7 @@ public:
   }
 
 private:
-  static const uint32_t TOUCH_SPI_FREQUENCY = 1000000;
-
-  uint16_t readAd(uint8_t command) {
-    digitalWrite(_tftCs, HIGH);
-    digitalWrite(_tcs, LOW);
-    SPI.transfer(command);
-    uint8_t data1 = SPI.transfer(0x00);
-    uint8_t data2 = SPI.transfer(0x00);
-    digitalWrite(_tcs, HIGH);
-    return (uint16_t)((((uint16_t)data1 << 8) + data2) >> 3) & 0x0FFF;
-  }
-
-  uint16_t readStableAxis(uint8_t command) {
-    uint16_t a = 0, b = 0, c = 0;
-    SPI.beginTransaction(SPISettings(TOUCH_SPI_FREQUENCY, MSBFIRST, SPI_MODE0));
-    for (uint8_t attempt=0; attempt<12; attempt++) {
-      a = readAd(command);
-      delayMicroseconds(5);
-      b = readAd(command);
-      delayMicroseconds(5);
-      c = readAd(command);
-      if (closeEnough(a, b) && closeEnough(a, c)) break;
-    }
-    SPI.endTransaction();
-    digitalWrite(_tcs, HIGH);
-    return (uint16_t)(((uint32_t)a + b + c) / 3);
-  }
-
-  static bool closeEnough(uint16_t a, uint16_t b) {
-    return (a > b) ? ((a - b) < 10) : ((b - a) < 10);
-  }
-
-  static int16_t clampToDisplay(int16_t value, int16_t limit) {
-    if (value < 0) return 0;
-    if (value >= limit) return limit - 1;
-    return value;
-  }
-
-  uint8_t  _tftCs;
-  uint8_t  _tcs;
+  Adafruit_STMPE610 _ts;
   uint8_t  _tirq;
   bool     _touchOk = false;
   int16_t  _rx1=0, _ry1=0, _rx2=4095, _ry2=4095;
