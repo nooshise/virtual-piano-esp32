@@ -38,6 +38,26 @@
 | UI | __________ | ___ | עבר / נכשל | __________ |
 | Sensor | __________ | ___ | עבר / נכשל | __________ |
 
+## Wave 3 - תיעוד upload מבוקר
+
+Wave 2 כבר אישר קומפילציה תקינה לשתי הסקיצות. בסעיף זה יש לתעד העלאה לחומרה בלבד.
+
+| לוח | סקיצה | COM port | כלי העלאה | תוצאה | קובץ לוג / צילום מסך |
+|---|---|---|---|---|---|
+| Sensor | `SENS_FIXED/SENS_FIXED.ino` | `COM__` | Arduino CLI / Arduino IDE | עבר / נכשל | __________ |
+| UI | `instrument_config/instrument_config.ino` | `COM__` | Arduino CLI / Arduino IDE | עבר / נכשל | __________ |
+
+פקודות CLI מתוכננות:
+
+```powershell
+arduino-cli upload --fqbn esp32:esp32:esp32 --port COM_SENSOR SENS_FIXED
+arduino-cli upload --fqbn esp32:esp32:esp32 --port COM_UI instrument_config
+```
+
+הערות upload:
+
+__________________________________________________________________
+
 ## Serial Monitor
 
 | לוח | Baud | הודעת התחלה צפויה | נצפה בפועל | סטטוס |
