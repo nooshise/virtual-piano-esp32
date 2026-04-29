@@ -17,7 +17,8 @@ static void handleTrigger(uint8_t s1to8, uint16_t mm) {
   lastTrigMs[k] = now;
 
   uint8_t inst = keyCfg[k].inst;
-  uint8_t note = keyCfg[k].note;
+  updateAutoKeyboardMode();
+  uint8_t note = effectiveChoiceForKey(k);
   uint16_t track = trackFor(inst, note);
 
   Serial.print("[RF TRIG] key=");
@@ -83,7 +84,7 @@ void sendKeyColor(uint8_t keyIndex) {
   RF.print("C,");
   RF.print(keyIndex + 1);
   RF.print(",");
-  RF.println(keyCfg[keyIndex].colorIdx);
+  RF.println(colorForKey(keyIndex));
 }
 
 void sendAllColors() {

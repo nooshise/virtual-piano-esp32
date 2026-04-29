@@ -28,7 +28,7 @@
 
 | סקיצה | נתיב | תוצאה | הודעת שגיאה אם קיימת |
 |---|---|---|---|
-| UI | `instrument_config/instrument_config.ino` | עבר | `401440 bytes` program, `24716 bytes` RAM |
+| UI | `instrument_config/instrument_config.ino` | עבר | `403132 bytes` program, `24732 bytes` RAM |
 | Sensor | `SENS_FIXED/SENS_FIXED.ino` | עבר | `357373 bytes` program, `29196 bytes` RAM |
 
 ## העלאה ללוחות

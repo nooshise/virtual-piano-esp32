@@ -55,7 +55,7 @@ arduino-cli compile --fqbn esp32:esp32:uPesy_wroom --libraries "C:\Users\shash\O
 
 Results:
 
-- UI: passed. Sketch uses 401440 bytes program storage and 24716 bytes dynamic memory.
+- UI: passed. Sketch uses 403132 bytes program storage and 24732 bytes dynamic memory after aligning the screen flow with the known-working `instrument_config_fixed.ino` reference.
 - Sensor: passed. Sketch uses 357373 bytes program storage and 29196 bytes dynamic memory.
 
 ## Stage 4 - Touch Integration
@@ -90,6 +90,14 @@ if (lcd.touched()) {
 ```
 
 The UI no longer depends on local-only helper methods such as `touchOk()`, `drainFifo()`, or `xRaw`.
+
+## Known-Working Screen Reference
+
+After the initial refactor, the UI screen flow was aligned with:
+
+`C:\Users\shash\OneDrive\שולחן העבודה\קודים שעבדו\גיבוי קוד חיישנים פלוס סמלים של כלי נגינה\instrument_config_fixed.ino`
+
+Only the UI behavior was brought over. The combined reference sketch's local sensor, DFPlayer, and NeoPixel logic was not merged into `instrument_config/`, because this repository keeps those responsibilities split across the two ESP32 boards.
 
 ## Behavior Intentionally Preserved
 

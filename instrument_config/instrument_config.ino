@@ -11,9 +11,15 @@
 tft9341touch lcd(TFT_CS_PIN, TFT_DC_PIN, TOUCH_CS_PIN, TOUCH_IRQ_PIN);
 
 KeyCfg keyCfg[NUM_KEYS];
+uint8_t instrumentColor[INST_COUNT];
 uint32_t lastTrigMs[NUM_KEYS] = {0};
 Screen screen = SCR_MAIN;
 uint8_t selKey = 0;
+uint8_t colorPickInstrument = 0;
+uint8_t pendingTakeColor = NO_COLOR;
+uint8_t pendingTakeOwner = 255;
+bool autoKeyboardActive = false;
+uint8_t autoInstrumentId = 0;
 
 void setup() {
   Serial.begin(115200);
@@ -26,9 +32,12 @@ void setup() {
   Serial.println("[TOUCH] using external library");
 
   for (uint8_t k = 0; k < NUM_KEYS; k++) {
-    keyCfg[k].inst = k;
+    keyCfg[k].inst = 0;
     keyCfg[k].note = k & 7;
-    keyCfg[k].colorIdx = k % NUM_COLORS;
+    keyCfg[k].colorIdx = NO_COLOR;
+  }
+  for (uint8_t i = 0; i < INST_COUNT; i++) {
+    instrumentColor[i] = i % NUM_COLORS;
   }
   calcLayout();
 

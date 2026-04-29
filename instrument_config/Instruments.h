@@ -5,11 +5,15 @@
 
 // Names and palettes shared by drawing, RF color sync, and playback logs.
 static const char* const INST_NAMES[INST_COUNT] = {
-  "Piano", "Guitar", "Drums", "Trumpet", "Violin", "Accordn", "Oud", "Fan"
+  "Piano", "Guitar", "Drums", "Trumpet", "Violin", "Accordion", "Oud", "Fan"
 };
 
 static const char* const NOTE_NAMES[NUM_KEYS] = {
   "Do", "Re", "Mi", "Fa", "Sol", "La", "Si", "Do2"
+};
+
+static const char* const DRUM_NAMES[NUM_KEYS] = {
+  "Kick", "Snare", "HiHat", "Tom", "Clap", "Crash", "Ride", "Perc"
 };
 
 static const uint16_t COLORS565[NUM_COLORS] = {
@@ -17,5 +21,5 @@ static const uint16_t COLORS565[NUM_COLORS] = {
 };
 
 static const char* const COLOR_NAMES[NUM_COLORS] = {
-  "Red", "Grn", "Blue", "Yel", "Cyan", "Mag", "Org", "Wht"
+  "Red", "Green", "Blue", "Yellow", "Cyan", "Magenta", "Orange", "White"
 };
