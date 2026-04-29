@@ -17,6 +17,8 @@
 #include <Adafruit_VL6180X.h>
 #include <Adafruit_NeoPixel.h>
 
+typedef enum { ST_NONE=0, ST_VL53=1, ST_VL618=2 } SensorType;
+
 static const int      I2C_SDA  = 21;
 static const int      I2C_SCL  = 22;
 static const uint32_t I2C_HZ   = 100000;
@@ -80,8 +82,6 @@ static const uint8_t  NCH            = 8;
 static const uint16_t MIN_VL53  = 50;   // normalize: worst-case VL53L0X min range
 static const uint16_t MIN_VL618 = 10;
 static const uint16_t TRIG_MAX_MM = 150; // never trigger beyond 15cm (avoids far false-triggers)
-
-typedef enum { ST_NONE=0, ST_VL53=1, ST_VL618=2 } SensorType;
 
 struct ChanState {
   SensorType type      = ST_NONE;
