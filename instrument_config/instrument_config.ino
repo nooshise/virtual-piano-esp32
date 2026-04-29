@@ -390,7 +390,7 @@ static void touchTick() {
   int16_t x=lcd.xTouch, y=lcd.yTouch;
 
   // --- Debug: print raw + mapped coords to Serial always ---
-  Serial.printf("[TOUCH] raw=%d,%d  mapped=%d,%d  screen=%s\n",
+  Serial.printf("[TOUCH] raw=%d,%d mapped=%d,%d screen=%s\n",
     lcd.xRaw, lcd.yRaw, x, y,
     screen==SCR_MAIN?"MAIN":screen==SCR_CFG?"CFG":screen==SCR_INST?"INST":"COLOR");
   // Show mapped coords on screen (top-right corner) for visual calibration check
@@ -402,14 +402,14 @@ static void touchTick() {
 
   if (screen==SCR_MAIN) {
     int k=hitKey(x,y);
-    if (k>=0) { selKey=(uint8_t)k; drawCfg(selKey); screen=SCR_CFG; }
+    if (k>=0) { Serial.print("[HIT] key="); Serial.println(k); selKey=(uint8_t)k; screen=SCR_CFG; Serial.println("[SCREEN] name=CFG"); drawCfg(selKey); }
     waitRelease(); return;
   }
   if (screen==SCR_CFG) {
     int8_t btn=lcd.ButtonTouch(x,y);
-    if (btn==BTN_BACK)  { drawMain(); screen=SCR_MAIN; waitRelease(); return; }
-    if (btn==BTN_INST)  { drawInstPicker(selKey); screen=SCR_INST; waitRelease(); return; }
-    if (btn==BTN_COLOR) { drawColorPicker(selKey); screen=SCR_COLOR; waitRelease(); return; }
+    if (btn==BTN_BACK)  { screen=SCR_MAIN;  Serial.println("[SCREEN] name=MAIN");  drawMain(); waitRelease(); return; }
+    if (btn==BTN_INST)  { screen=SCR_INST;  Serial.println("[SCREEN] name=INST");  drawInstPicker(selKey); waitRelease(); return; }
+    if (btn==BTN_COLOR) { screen=SCR_COLOR; Serial.println("[SCREEN] name=COLOR"); drawColorPicker(selKey); waitRelease(); return; }
     if (btn==BTN_NOTE_M) {
       keyCfg[selKey].note=(keyCfg[selKey].note==0)?7:(keyCfg[selKey].note-1);
       drawCfg(selKey); waitRelease(); return;
@@ -422,12 +422,12 @@ static void touchTick() {
   }
   if (screen==SCR_INST) {
     int8_t btn=lcd.ButtonTouch(x,y);
-    if (btn==BTN_BACK) { drawCfg(selKey); screen=SCR_CFG; waitRelease(); return; }
+    if (btn==BTN_BACK) { screen=SCR_CFG; Serial.println("[SCREEN] name=CFG"); drawCfg(selKey); waitRelease(); return; }
     int inst=hitInst(x,y);
     if (inst>=0) {
       keyCfg[selKey].inst=(uint8_t)inst;
       checkAutoNotes();        // auto-assign Do..Do2 if all keys same instrument
-      drawCfg(selKey); screen=SCR_CFG;
+      screen=SCR_CFG; Serial.println("[SCREEN] name=CFG"); drawCfg(selKey);
       // Redraw ALL tiles on main (auto-notes may have changed them all)
       // We'll refresh them when returning to main
     }
@@ -435,7 +435,7 @@ static void touchTick() {
   }
   if (screen==SCR_COLOR) {
     int8_t btn=lcd.ButtonTouch(x,y);
-    if (btn==BTN_BACK)  { drawCfg(selKey); screen=SCR_CFG; waitRelease(); return; }
+    if (btn==BTN_BACK)  { screen=SCR_CFG; Serial.println("[SCREEN] name=CFG"); drawCfg(selKey); waitRelease(); return; }
     if (btn==BTN_NONE)  {
       keyCfg[selKey].colorIdx=NO_COLOR;
       sendKeyColor(selKey);        // tell SENS board: LED off for this key
@@ -457,9 +457,14 @@ void setup() {
   Serial.begin(115200); delay(300);
   Serial.println("\n=== VIRTUAL PIANO UI ===");
 
+  Serial.println("[TFT] begin");
   lcd.begin();
-  lcd.setTouch(489, 3811, 3780, 372);  // rotation=3: pairs swapped vs rotation=1
-  Serial.println(lcd.touchOk() ? "Touch: OK" : "Touch: FAIL — check wiring/CS pin");
+  lcd.setTouch(3780, 372, 489, 3811);
+  Serial.println(lcd.touchOk() ? "[TOUCH] OK" : "[TOUCH] FAIL");
+  if (!lcd.touchOk()) {
+    Serial.print("[TOUCH] diag tcs=15 tirq=35 tirqLevel=");
+    Serial.println(digitalRead(35));
+  }
 
   // Default key config: each key gets a unique instrument + sequential notes + color
   for (uint8_t k=0;k<NUM_KEYS;k++) {
@@ -479,6 +484,7 @@ void setup() {
   sendAllColors();
 
   drawMain();
+  Serial.println("[SCREEN] name=MAIN");
   dfInitStart();
 }
 
