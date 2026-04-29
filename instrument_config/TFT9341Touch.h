@@ -21,14 +21,23 @@ public:
   tft9341touch(uint8_t cs, uint8_t dc, uint8_t tcs, uint8_t tirq)
     : Adafruit_ILI9341(cs, dc),
       _ts((uint8_t)tcs, &SPI),
+      _tftCs(cs),
+      _tcs(tcs),
       _tirq(tirq)
   {}
 
   bool begin() {
+    pinMode(_tftCs, OUTPUT);
+    pinMode(_tcs, OUTPUT);
+    digitalWrite(_tftCs, HIGH);
+    digitalWrite(_tcs, HIGH);
+
     Adafruit_ILI9341::begin();
     setRotation(3);       // landscape 320x240, correct orientation
     fillScreen(0x0000);
 
+    digitalWrite(_tftCs, HIGH);
+    digitalWrite(_tcs, HIGH);
     pinMode(_tirq, INPUT);  // active-LOW open-drain; board has pull-up
 
     _touchOk = _ts.begin();
@@ -141,6 +150,8 @@ public:
 
 private:
   Adafruit_STMPE610 _ts;
+  uint8_t  _tftCs;
+  uint8_t  _tcs;
   uint8_t  _tirq;
   bool     _touchOk = false;
   int16_t  _rx1=0, _ry1=0, _rx2=4095, _ry2=4095;
